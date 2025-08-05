@@ -1,0 +1,186 @@
+import torch
+import numpy as np
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from datasets import Dataset, load_dataset
+import pandas as pd
+from typing import List, Dict, Tuple, Optional
+import logging
+from tqdm import tqdm
+import json
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class DPODifficultySelector:
+    
+    def __init__(self, 
+                 dpo_model_path: str = "<dpo_model_path>",
+                 ref_model_path: str = "<ref_model_path>",
+                 beta: float = 0.1,
+                 device: str = "cuda" if torch.cuda.is_available() else "cpu",
+                 batch_size: int = 8):
+        
+        self.dpo_model_path = dpo_model_path
+        self.ref_model_path = ref_model_path
+        self.beta = beta
+        self.device = device
+        self.batch_size = batch_size
+        
+        logger.info(f"Loading DPO model: {dpo_model_path}")
+        self.dpo_model = AutoModelForCausalLM.from_pretrained(
+            dpo_model_path, 
+            torch_dtype=torch.float16,
+            device_map="auto"
+        )
+        self.dpo_tokenizer = AutoTokenizer.from_pretrained(dpo_model_path)
+        
+        logger.info(f"Loading reference model: {ref_model_path}")
+        self.ref_model = AutoModelForCausalLM.from_pretrained(
+            ref_model_path,
+            torch_dtype=torch.float16, 
+            device_map="auto"
+        )
+        self.ref_tokenizer = AutoTokenizer.from_pretrained(ref_model_path)
+        
+        if self.dpo_tokenizer.pad_token is None:
+            self.dpo_tokenizer.pad_token = self.dpo_tokenizer.eos_token
+        if self.ref_tokenizer.pad_token is None:
+            self.ref_tokenizer.pad_token = self.ref_tokenizer.eos_token
+            
+        self.dpo_model.eval()
+        self.ref_model.eval()
+        
+    def compute_log_probs(self, model, tokenizer, prompts: List[str], responses: List[str]) -> torch.Tensor:
+        
+        log_probs = []
+        
+        for i in tqdm(range(0, len(prompts), self.batch_size), desc="Computing log probabilities"):
+            batch_prompts = prompts[i:i+self.batch_size]
+            batch_responses = responses[i:i+self.batch_size]
+            
+            prompt_tokens = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True)
+            full_sequences = [p + r for p, r in zip(batch_prompts, batch_responses)]
+            full_tokens = tokenizer(full_sequences, return_tensors="pt", padding=True, truncation=True)
+            
+            prompt_lengths = prompt_tokens['attention_mask'].sum(dim=1)
+            
+            with torch.no_grad():
+                outputs = model(full_tokens['input_ids'].to(self.device))
+                logits = outputs.logits
+                
+                batch_log_probs = []
+                for j in range(len(batch_prompts)):
+                    prompt_len = prompt_lengths[j].item()
+                    response_tokens = full_tokens['input_ids'][j][prompt_len:]
+                    response_logits = logits[j][prompt_len-1:-1]
+                    
+                    log_probs_seq = torch.log_softmax(response_logits, dim=-1)
+                    token_log_probs = log_probs_seq.gather(1, response_tokens.unsqueeze(1).to(self.device)).squeeze()
+                    
+                    total_log_prob = token_log_probs.sum().item()
+                    batch_log_probs.append(total_log_prob)
+                    
+            log_probs.extend(batch_log_probs)
+            
+        return torch.tensor(log_probs)
+    
+    def compute_dpo_rewards(self, prompts: List[str], responses: List[str]) -> torch.Tensor:
+        # r_DPO(x,y) = β * log[π_DPO(y|x) / π_ref(y|x)]
+        dpo_log_probs = self.compute_log_probs(self.dpo_model, self.dpo_tokenizer, prompts, responses)
+        ref_log_probs = self.compute_log_probs(self.ref_model, self.ref_tokenizer, prompts, responses)
+        
+        dpo_rewards = self.beta * (dpo_log_probs - ref_log_probs)
+        return dpo_rewards
+    
+    def compute_reward_gaps(self, dataset: Dataset) -> np.ndarray:
+        
+        prompts = dataset['prompt']
+        chosen_responses = dataset['chosen']  
+        rejected_responses = dataset['rejected']
+        
+        chosen_rewards = self.compute_dpo_rewards(prompts, chosen_responses)
+        rejected_rewards = self.compute_dpo_rewards(prompts, rejected_responses)
+        
+        # Δr_DPO = r_DPO(x, y_w) - r_DPO(x, y_l)
+        reward_gaps = chosen_rewards - rejected_rewards
+        return reward_gaps.numpy()
+    
+    def select_difficult_examples(self, 
+                                dataset: Dataset, 
+                                selection_ratio: str = "<selection_ratio>") -> Dataset:
+        
+        selection_ratio = float(selection_ratio)
+        logger.info(f"Starting difficulty-based selection with ratio: {selection_ratio}")
+        
+        # Stage 1: Compute reward gaps
+        reward_gaps = self.compute_reward_gaps(dataset)
+        
+        # Stage 2: Rank by difficulty (smaller gaps = more difficult)
+        sorted_indices = np.argsort(reward_gaps)
+        
+        # Stage 3: Select top difficult examples
+        num_selected = int(len(dataset) * selection_ratio)
+        selected_indices = sorted_indices[:num_selected]
+        
+        selected_dataset = dataset.select(selected_indices)
+        
+        logger.info(f"Selected {len(selected_dataset)} examples out of {len(dataset)} total")
+        return selected_dataset
+
+def load_preference_dataset(dataset_path: str = "<dataset_path>") -> Dataset:
+    
+    logger.info(f"Loading dataset: {dataset_path}")
+    
+    if dataset_path.startswith("http") or "/" in dataset_path:
+        dataset = load_dataset(dataset_path, split="train")
+    else:
+        dataset = load_dataset(dataset_path, split="train")
+    
+    required_fields = ['prompt', 'chosen', 'rejected']
+    for field in required_fields:
+        if field not in dataset.column_names:
+            raise ValueError(f"Dataset must contain '{field}' field")
+    
+    logger.info(f"Loaded {len(dataset)} preference pairs")
+    return dataset
+
+def save_selected_dataset(dataset: Dataset, output_path: str = "<output_path>"):
+    
+    logger.info(f"Saving selected dataset to: {output_path}")
+    
+    if output_path.endswith('.json'):
+        dataset.to_json(output_path)
+    elif output_path.endswith('.parquet'):
+        dataset.to_parquet(output_path)
+    else:
+        dataset.to_json(output_path + '.json')
+    
+    logger.info(f"Successfully saved {len(dataset)} selected examples")
+
+def main():
+    
+    dpo_model_path = "<dpo_model_path>"
+    ref_model_path = "<ref_model_path>"
+    selection_ratio = "<selection_ratio>"
+    dataset_path = "<dataset_path>"
+    output_path = "<output_path>" # e.g., ./results/selected_dataset.json
+    
+    try:
+        selector = DPODifficultySelector(
+            dpo_model_path=dpo_model_path,
+            ref_model_path=ref_model_path,
+            beta=0.1
+        )
+        
+        dataset = load_preference_dataset(dataset_path)
+        selected_dataset = selector.select_difficult_examples(dataset, selection_ratio)
+        save_selected_dataset(selected_dataset, output_path)
+        
+        logger.info("Difficulty-based preference data selection completed successfully!")
+        
+    except Exception as e:
+        logger.error(f"Error during selection process: {e}")
+        raise
+
+if __name__ == "__main__":
+    main()
