@@ -44,3 +44,10 @@ Reference: https://github.com/OpenRLHF/OpenRLHF
 Launch script: `src/DPO_training.sh`
 
 Required specifications: dataset path, base model, save path
+
+## Evaluation
+
+For testing on RewardBench and Alpaca Eval 2.0, please refer to their official repositories, where we use their standard test sets:
+
+- **RewardBench**: https://github.com/allenai/reward-bench
+- **Alpaca Eval 2.0**: https://github.com/tatsu-lab/alpaca_eval
