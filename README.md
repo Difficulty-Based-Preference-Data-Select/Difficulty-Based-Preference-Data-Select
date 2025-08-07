@@ -1,5 +1,7 @@
 # Difficulty-based Preference Data Selection
 
+**Paper**: https://arxiv.org/abs/2508.04149
+
 This repository implements the difficulty-based preference data selection method proposed in the paper "Difficulty-based Preference Data Selection by DPO Implicit Reward Gap". The approach identifies challenging preference examples by computing the DPO implicit reward gap between chosen and rejected responses, then selects samples with smaller gaps (higher difficulty) for more efficient model alignment training.
 
 Our method demonstrates that using only 10% of carefully selected preference data can achieve performance comparable to training on the full dataset. The selection process is based on the insight that examples with smaller reward gaps provide stronger learning signals and higher information content, making them more valuable for alignment training.
@@ -51,3 +53,18 @@ For testing on RewardBench and Alpaca Eval 2.0, please refer to their official r
 
 - **RewardBench**: https://github.com/allenai/reward-bench
 - **Alpaca Eval 2.0**: https://github.com/tatsu-lab/alpaca_eval
+
+## Citation
+
+```
+@misc{qi2025difficultybasedpreferencedataselection,
+      title={Difficulty-Based Preference Data Selection by DPO Implicit Reward Gap}, 
+      author={Xuan Qi and Rongwu Xu and Zhijing Jin},
+      year={2025},
+      eprint={2508.04149},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2508.04149}, 
+}
+```
+
